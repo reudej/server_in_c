@@ -1,7 +1,7 @@
 #include <kore/kore.h>
 #include <kore/http.h>
 #include <kore/pgsql.h>
-#include <sqlite3.h>
+#include <postgresql/libpq-fe.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -81,60 +81,59 @@ typedef struct {
 static template_t *templates = NULL;
 static session_t sessions[MAX_SESSIONS];
 static int session_count = 0;
-static sqlite3 *db = NULL;
+static PGconn *pg_conn = NULL;
 
 // =============================================================================
 // UTILITY FUNKCE
 // =============================================================================
 
-// Generování náhodných řetězců pro tokeny
 void generate_random_string(char *buffer, int length) {
     unsigned char random_bytes[length / 2];
     RAND_bytes(random_bytes, length / 2);
-    
     for (int i = 0; i < length / 2; i++) {
         sprintf(buffer + (i * 2), "%02x", random_bytes[i]);
     }
     buffer[length] = '\0';
 }
 
-// Sanitizace HTML
 char* sanitize_html(const char *input) {
     if (!input) return NULL;
-    
     int len = strlen(input);
-    char *output = malloc(len * 6 + 1); // Nejhorší případ: každý znak se nahradí entitou
+    char *output = malloc(len * 6 + 1);
     int out_pos = 0;
-    
     for (int i = 0; i < len; i++) {
         switch (input[i]) {
-            case '<':
-                strcpy(output + out_pos, "&lt;");
-                out_pos += 4;
-                break;
-            case '>':
-                strcpy(output + out_pos, "&gt;");
-                out_pos += 4;
-                break;
-            case '&':
-                strcpy(output + out_pos, "&amp;");
-                out_pos += 5;
-                break;
-            case '"':
-                strcpy(output + out_pos, "&quot;");
-                out_pos += 6;
-                break;
-            case '\'':
-                strcpy(output + out_pos, "&#x27;");
-                out_pos += 6;
-                break;
-            default:
-                output[out_pos++] = input[i];
-                break;
+            case '<': strcpy(output + out_pos, "&lt;"); out_pos += 4; break;
+            case '>': strcpy(output + out_pos, "&gt;"); out_pos += 4; break;
+            case '&': strcpy(output + out_pos, "&amp;"); out_pos += 5; break;
+            case '"': strcpy(output + out_pos, "&quot;"); out_pos += 6; break;
+            case '\'': strcpy(output + out_pos, "&#x27;"); out_pos += 6; break;
+            default: output[out_pos++] = input[i]; break;
         }
     }
     output[out_pos] = '\0';
     return output;
+}
+
+// =============================================================================
+// DATABÁZE POSTGRESQL
+// =============================================================================
+
+static struct kore_pgsql sql;
+
+void db_connect_async(struct http_request *req) {
+    if (!kore_pgsql_setup(&sql, req, "host=localhost dbname=webapp user=webuser password=secret")) {
+        kore_log(LOG_ERR, "pgsql_setup failed");
+        http_response(req, 500, "Database error", 14);
+    }
+}
+
+int db_insert_user(const char *name, const char *email) {
+    char query[1024];
+    snprintf(query, sizeof(query),
+             "INSERT INTO users (name, email) VALUES ('%s', '%s')",
+             name, email);
+    return kore_pgsql_query(&sql, query);
 }
 
 // =============================================================================
@@ -314,13 +313,52 @@ int validate_csrf_token(session_t *session, const char *token) {
 // DATABÁZOVÝ SYSTÉM
 // =============================================================================
 
-// Inicializace databáze
-int init_database(const char *db_path) {
-    int rc = sqlite3_open(db_path, &db);
-    if (rc) {
-        kore_log(LOG_ERR, "Nelze otevřít databázi: %s", sqlite3_errmsg(db));
+int init_database(const char *conninfo) {
+    pg_conn = PQconnectdb(conninfo);
+    if (PQstatus(pg_conn) != CONNECTION_OK) {
+        kore_log(LOG_ERR, "PostgreSQL připojení selhalo: %s", PQerrorMessage(pg_conn));
+        PQfinish(pg_conn);
         return 0;
     }
+    return 1;
+}
+
+int create_table(const char *query) {
+    PGresult *res = PQexec(pg_conn, query);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        kore_log(LOG_ERR, "Chyba při vytváření tabulky: %s", PQerrorMessage(pg_conn));
+        PQclear(res);
+        return 0;
+    }
+    PQclear(res);
+    return 1;
+}
+
+int model_insert(const char *table, const char **fields, const char **values, int count) {
+    char fields_buf[1024] = "";
+    char values_buf[1024] = "";
+
+    for (int i = 0; i < count; i++) {
+        strcat(fields_buf, fields[i]);
+        strcat(values_buf, "'");
+        strcat(values_buf, values[i]);
+        strcat(values_buf, "'");
+        if (i < count - 1) {
+            strcat(fields_buf, ", ");
+            strcat(values_buf, ", ");
+        }
+    }
+
+    char query[2048];
+    snprintf(query, sizeof(query), "INSERT INTO %s (%s) VALUES (%s);", table, fields_buf, values_buf);
+
+    PGresult *res = PQexec(pg_conn, query);
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        kore_log(LOG_ERR, "Insert selhal: %s", PQerrorMessage(pg_conn));
+        PQclear(res);
+        return 0;
+    }
+    PQclear(res);
     return 1;
 }
 
@@ -344,120 +382,53 @@ void model_add_field(db_model_t *model, const char *field_name, const char *fiel
     model->field_types[model->field_count - 1] = strdup(field_type);
 }
 
-// Vytvoření tabulky v databázi
-int create_table(db_model_t *model) {
-    char query[MAX_QUERY_SIZE];
-    snprintf(query, sizeof(query), "CREATE TABLE IF NOT EXISTS %s (id INTEGER PRIMARY KEY AUTOINCREMENT", 
-             model->table_name);
-    
-    for (int i = 0; i < model->field_count; i++) {
-        char field_def[256];
-        snprintf(field_def, sizeof(field_def), ", %s %s", 
-                 model->fields[i], model->field_types[i]);
-        strcat(query, field_def);
-    }
-    strcat(query, ")");
-    
-    char *err_msg = 0;
-    int rc = sqlite3_exec(db, query, 0, 0, &err_msg);
-    
-    if (rc != SQLITE_OK) {
-        kore_log(LOG_ERR, "SQL error: %s", err_msg);
-        sqlite3_free(err_msg);
-        return 0;
-    }
-    
-    return 1;
-}
-
-// Vložení záznamu do databáze
-int model_insert(db_model_t *model, char **values) {
-    char query[MAX_QUERY_SIZE];
-    char fields_str[512] = "";
-    char values_str[512] = "";
-    
-    for (int i = 0; i < model->field_count; i++) {
-        if (i > 0) {
-            strcat(fields_str, ", ");
-            strcat(values_str, ", ");
-        }
-        strcat(fields_str, model->fields[i]);
-        strcat(values_str, "?");
-    }
-    
-    snprintf(query, sizeof(query), "INSERT INTO %s (%s) VALUES (%s)", 
-             model->table_name, fields_str, values_str);
-    
-    sqlite3_stmt *stmt;
-    int rc = sqlite3_prepare_v2(db, query, -1, &stmt, NULL);
-    
-    if (rc != SQLITE_OK) {
-        kore_log(LOG_ERR, "Prepare failed: %s", sqlite3_errmsg(db));
-        return 0;
-    }
-    
-    for (int i = 0; i < model->field_count; i++) {
-        sqlite3_bind_text(stmt, i + 1, values[i], -1, SQLITE_STATIC);
-    }
-    
-    rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    
-    return (rc == SQLITE_DONE) ? 1 : 0;
-}
-
-// Dotaz na databázi
-db_result_t* model_select(db_model_t *model, const char *where_clause) {
+db_result_t* model_select(const char *table, const char *where_clause) {
     char query[MAX_QUERY_SIZE];
     if (where_clause) {
-        snprintf(query, sizeof(query), "SELECT * FROM %s WHERE %s", 
-                 model->table_name, where_clause);
+        snprintf(query, sizeof(query), "SELECT * FROM %s WHERE %s", table, where_clause);
     } else {
-        snprintf(query, sizeof(query), "SELECT * FROM %s", model->table_name);
+        snprintf(query, sizeof(query), "SELECT * FROM %s", table);
     }
-    
-    sqlite3_stmt *stmt;
-    int rc = sqlite3_prepare_v2(db, query, -1, &stmt, NULL);
-    
-    if (rc != SQLITE_OK) {
-        kore_log(LOG_ERR, "Prepare failed: %s", sqlite3_errmsg(db));
+
+    PGresult *res = PQexec(pg_conn, query);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        kore_log(LOG_ERR, "Dotaz selhal: %s", PQerrorMessage(pg_conn));
+        PQclear(res);
         return NULL;
     }
-    
+
     db_result_t *result = malloc(sizeof(db_result_t));
-    result->records = NULL;
-    result->record_count = 0;
-    result->field_count = sqlite3_column_count(stmt);
-    
-    // Získat názvy sloupců
+    result->record_count = PQntuples(res);
+    result->field_count = PQnfields(res);
+
     result->field_names = malloc(sizeof(char*) * result->field_count);
     for (int i = 0; i < result->field_count; i++) {
-        result->field_names[i] = strdup(sqlite3_column_name(stmt, i));
+        result->field_names[i] = strdup(PQfname(res, i));
     }
-    
-    // Načíst záznamy
+
     db_record_t *last_record = NULL;
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    result->records = NULL;
+
+    for (int r = 0; r < result->record_count; r++) {
         db_record_t *record = malloc(sizeof(db_record_t));
         record->field_count = result->field_count;
         record->values = malloc(sizeof(char*) * record->field_count);
         record->next = NULL;
-        
-        for (int i = 0; i < record->field_count; i++) {
-            const char *value = (const char*)sqlite3_column_text(stmt, i);
-            record->values[i] = value ? strdup(value) : strdup("");
+
+        for (int f = 0; f < result->field_count; f++) {
+            char *val = PQgetvalue(res, r, f);
+            record->values[f] = strdup(val ? val : "");
         }
-        
+
         if (last_record) {
             last_record->next = record;
         } else {
             result->records = record;
         }
         last_record = record;
-        result->record_count++;
     }
-    
-    sqlite3_finalize(stmt);
+
+    PQclear(res);
     return result;
 }
 
@@ -477,115 +448,4 @@ session_t* get_session_from_request(struct http_request *req) {
 // Nastavení session cookie
 void set_session_cookie(struct http_request *req, session_t *session) {
     http_response_cookie(req, "sessionid", session->session_id, "/", 0, 0, NULL);
-}
-
-// Hlavní handler pro domovskou stránku
-int home_handler(struct http_request *req) {
-    session_t *session = get_session_from_request(req);
-    if (!session) {
-        session = create_session();
-        if (session) {
-            set_session_cookie(req, session);
-        }
-    }
-    
-    template_context_t *ctx = create_template_context();
-    context_add(ctx, "title", "Domovská stránka");
-    context_add(ctx, "message", "Vítejte v C Web Frameworku!");
-    
-    if (session) {
-        context_add(ctx, "csrf_token", session->csrf.token);
-    }
-    
-    char *rendered = render_template("home", ctx);
-    
-    if (rendered) {
-        http_response(req, 200, rendered, strlen(rendered));
-        free(rendered);
-    } else {
-        http_response(req, 500, "Template not found", 18);
-    }
-    
-    return KORE_RESULT_OK;
-}
-
-// Handler pro formuláře s CSRF ochranou
-int form_handler(struct http_request *req) {
-    if (req->method == HTTP_METHOD_POST) {
-        session_t *session = get_session_from_request(req);
-        if (!session) {
-            http_response(req, 403, "No session", 10);
-            return KORE_RESULT_OK;
-        }
-        
-        char *csrf_token;
-        if (http_argument_get_string(req, "csrf_token", &csrf_token) != KORE_RESULT_OK) {
-            http_response(req, 403, "Missing CSRF token", 18);
-            return KORE_RESULT_OK;
-        }
-        
-        if (!validate_csrf_token(session, csrf_token)) {
-            http_response(req, 403, "Invalid CSRF token", 18);
-            return KORE_RESULT_OK;
-        }
-        
-        // Zpracovat formulář
-        char *name, *email;
-        if (http_argument_get_string(req, "name", &name) == KORE_RESULT_OK &&
-            http_argument_get_string(req, "email", &email) == KORE_RESULT_OK) {
-            
-            // Sanitizace
-            char *safe_name = sanitize_html(name);
-            char *safe_email = sanitize_html(email);
-            
-            // Uložit do databáze (příklad)
-            db_model_t *user_model = create_model("users");
-            model_add_field(user_model, "name", "TEXT");
-            model_add_field(user_model, "email", "TEXT");
-            
-            char *values[] = {safe_name, safe_email};
-            model_insert(user_model, values);
-            
-            free(safe_name);
-            free(safe_email);
-            
-            http_response(req, 200, "Form submitted successfully", 24);
-        } else {
-            http_response(req, 400, "Missing form data", 17);
-        }
-    } else {
-        // Zobrazit formulář
-        session_t *session = get_session_from_request(req);
-        if (!session) {
-            session = create_session();
-            set_session_cookie(req, session);
-        }
-        
-        template_context_t *ctx = create_template_context();
-        context_add(ctx, "title", "Formulář");
-        context_add(ctx, "csrf_token", session->csrf.token);
-        
-        char *rendered = render_template("form", ctx);
-        
-        if (rendered) {
-            http_response(req, 200, rendered, strlen(rendered));
-            free(rendered);
-        } else {
-            http_response(req, 500, "Template not found", 18);
-        }
-    }
-    
-    return KORE_RESULT_OK;
-}
-
-// =============================================================================
-// EXPORTOVANÉ FUNKCE PRO KORE.IO
-// =============================================================================
-
-int page_handler(struct http_request *req) {
-    return home_handler(req);
-}
-
-int form_page_handler(struct http_request *req) {
-    return form_handler(req);
 }
