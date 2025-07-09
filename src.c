@@ -338,7 +338,26 @@ char* sanitize_sql_value(const char *input, const int single_or_double_quote) {
     return sanitized;
 }
 
-// Zavést funkci: int is_valid_where_clause
+int validate_where_clause(const char *where_clause) {
+    if (!where_clause) return 0;
+
+    for (int i = 0; where_clause[i] != '\0'; i++) {
+        char c = where_clause[i];
+
+        if (isalnum((unsigned char)c) || c == '_' || c == ' ' || c == '\t' ||
+            c == '=' || c == '<' || c == '>' || c == '!' ||
+            c == '(' || c == ')' || c == ',' || c == '\'' || c == '.' ||
+            c == '%' || c == '_' || c == '-' ) {
+            // povolený znak
+            continue;
+        }
+
+        // nepovolený znak
+        return 0;
+    }
+
+    return 1;
+}
 
 int is_valid_sql_id(const char *s) {
     if (!s || strlen(s) == 0 || strlen(s) > MAX_IDENTIFIER_LEN)
@@ -470,7 +489,11 @@ db_result_t* sql_select(const char *table, const char *where_clause) {
 
     char query[MAX_QUERY_SIZE];
     if (where_clause) {
-        snprintf(query, sizeof(query), "SELECT * FROM %s WHERE %s", table, where_clause);
+        if (validate_where_clause(where_clause)) snprintf(query, sizeof(query), "SELECT * FROM %s WHERE %s", table, where_clause);
+        else {
+            kore_log(LOG_ERR, "SQL select failed: invalid or unsupported where claause: %s", where_clause);
+            return NULL;
+        }
     } else {
         snprintf(query, sizeof(query), "SELECT * FROM %s", table);
     }
